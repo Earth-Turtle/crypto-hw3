@@ -4,6 +4,9 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import os
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import algorithms
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import secrets
+import string
 class PasswordManager:
     MAX_PASSWORD_LEN = 64
 
@@ -21,12 +24,24 @@ class PasswordManager:
         Raises:
             ValueError : malformed serialized format
         """
-        self.kvs = {}
-        if data is not None:
-            self.kvs = pickle.loads(bytes.fromhex(data))
-        else:
-            self.salt = os.random(16)
-            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length = 32, salt = os.urandom(16), iterations=2000000, backend=default_backend())
+        self.invalid = False
+        if data is not None: # If there's already a store to load, do this
+            # Check checksum first
+            digest = hashes.Hash(hashes.SHA256())
+            digest.update(bytes.fromhex(data))
+
+            if digest.finalize() != bytes.fromhex(checksum):
+                self.invalid = True
+                raise ValueError("Malformed serialized data")
+            self.register, self.salt = pickle.loads(bytes.fromhex(data)) # The register is currently hex-encrypted
+            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length = 32, salt = self.salt, iterations=2000000, backend=default_backend())
+            self.key = kdf.derive(bytes(password, 'ascii'))
+
+        else:                # If we need to generate a new store, do this
+            self.salt = os.urandom(16)
+            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length = 32, salt = self.salt, iterations=2000000, backend=default_backend())
+            self.key = kdf.derive(bytes(password, 'ascii'))
+            self.register = {}
 
     def dump(self):
         """Computes a serialized representation of the password manager
@@ -38,7 +53,11 @@ class PasswordManager:
             checksum (str) : a hex-encoded checksum for the data used to protect
                        against rollback attacks (up to 32 characters in length)
         """
-        return pickle.dumps(self.kvs).hex(), ''
+        self.check_status()
+        data = pickle.dumps((self.register, self.salt)).hex()
+        digest = hashes.Hash(hashes.SHA256())
+        digest.update(bytes.fromhex(data))
+        return data, digest.finalize().hex()
 
     def get(self, domain):
         """Fetches the password associated with a domain from the password
@@ -51,8 +70,14 @@ class PasswordManager:
             password (str) : the password associated with the requested domain if
                        it exists and otherwise None
         """
-        if domain in self.kvs:
-            return self.kvs[domain]
+        print("getting", domain)
+        self.check_status()
+        dom_hash = self.to_hash(domain)
+        if dom_hash in self.register:
+            (enc_passwd, nonce) = self.register[dom_hash]
+            aesgsm = AESGCM(self.key)
+            password = aesgsm.decrypt(nonce=nonce, data=enc_passwd, associated_data=dom_hash)
+            return password.decode('ascii')
         return None
 
     def set(self, domain, password):
@@ -70,10 +95,18 @@ class PasswordManager:
        Raises:
          ValueError : if password length exceeds the maximum
         """
+        print("setting", domain)
+        self.check_status()
         if len(password) > self.MAX_PASSWORD_LEN:
             raise ValueError('Maximum password length exceeded')
-        
-        self.kvs[domain] = password
+        dom_hash = self.to_hash(domain)
+        if dom_hash in self.register:
+            raise ValueError("Domain already in manager")
+
+        aesgcm = AESGCM(self.key)
+        nonce = os.urandom(12)
+        enc_passwd = aesgcm.encrypt(nonce=nonce, data=bytes(password, 'ascii'), associated_data=dom_hash)
+        self.register[dom_hash] = (enc_passwd, nonce)
 
 
     def remove(self, domain):
@@ -87,8 +120,10 @@ class PasswordManager:
          success (bool) : True if the domain was removed and False if the domain was
                                                     not found
         """
-        if domain in self.kvs:
-            del self.kvs[domain]
+        self.check_status()
+        dom_hash = self.to_hash(domain)
+        if dom_hash in self.register:
+            del self.register[dom_hash]
             return True
 
         return False
@@ -110,12 +145,23 @@ class PasswordManager:
          ValueError : if a password already exists for the provided domain
          ValueError : if the requested password length exceeds the maximum
         """
-        if domain in self.kvs:
+        self.check_status()
+        if domain in self.register:
             raise ValueError('Domain already in database')
         if desired_len > self.MAX_PASSWORD_LEN:
             raise ValueError('Maximum password length exceeded')
-
-        new_password = '0'*desired_len
+        alphabet = string.ascii_letters + string.digits
+        new_password = ''.join(secrets.choice(alphabet) for _ in range(desired_len))
         self.set(domain, new_password)
 
         return new_password
+
+    # helper functions
+    def to_hash(self, str):
+        digest = hashes.Hash(hashes.SHA256())
+        digest.update(bytes(str, 'ascii'))
+        return digest.finalize()
+
+    def check_status(self):
+        if self.invalid:
+            raise ValueError("Inconsistent state")

@@ -76,8 +76,8 @@ class PasswordManager:
         if dom_hash in self.register:
             (enc_passwd, nonce) = self.register[dom_hash]
             aesgsm = AESGCM(self.key)
-            password = aesgsm.decrypt(nonce=nonce, data=enc_passwd, associated_data=dom_hash)
-            return password.decode('ascii')
+            padded_password = aesgsm.decrypt(nonce=nonce, data=enc_passwd, associated_data=dom_hash).decode('ascii')
+            return padded_password.rstrip("\0")
         return None
 
     def set(self, domain, password):
@@ -105,7 +105,8 @@ class PasswordManager:
 
         aesgcm = AESGCM(self.key)
         nonce = os.urandom(12)
-        enc_passwd = aesgcm.encrypt(nonce=nonce, data=bytes(password, 'ascii'), associated_data=dom_hash)
+        padded_pwd = password.ljust(self.MAX_PASSWORD_LEN,"\0")
+        enc_passwd = aesgcm.encrypt(nonce=nonce, data=bytes(padded_pwd, 'ascii'), associated_data=dom_hash)
         self.register[dom_hash] = (enc_passwd, nonce)
 
 
